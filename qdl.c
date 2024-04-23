@@ -51,6 +51,7 @@
 #include <unistd.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
+#include <time.h>
 
 #include "qdl.h"
 #include "patch.h"
@@ -67,7 +68,7 @@ enum {
 };
 
 bool qdl_debug;
-static struct qdl_device qdl;
+int qdl_usb_open_timeout;
 
 static int detect_type(const char *xml_file)
 {
@@ -274,13 +275,29 @@ static int usb_open(struct qdl_device *qdl)
 
 	fprintf(stderr, "Waiting for EDL device\n");
 
+	time_t t0 = time(0);
 	for (;;) {
 		fd_set rfds;
 
 		FD_ZERO(&rfds);
 		FD_SET(mon_fd, &rfds);
 
-		ret = select(mon_fd + 1, &rfds, NULL, NULL, NULL);
+		if (qdl_usb_open_timeout > 0) {
+			time_t t1 = time(0);
+			time_t diff = (time_t)difftime(t1, t0+(time_t)qdl_usb_open_timeout);
+			if(diff >= 0)
+			{
+				fprintf(stderr, "Waiting for EDL device: Timeout reached, exit with error\n");
+				return -2;
+			}
+			time_t timeout_sec = abs(diff);
+
+			struct timeval tv = {timeout_sec, 0};
+			ret = select(mon_fd + 1, &rfds, NULL, NULL, &tv);
+		} else {
+			ret = select(mon_fd + 1, &rfds, NULL, NULL, NULL);
+		}
+
 		if (ret < 0)
 			return -1;
 
@@ -353,7 +370,7 @@ int qdl_write(struct qdl_device *qdl, const void *buf, size_t len)
 
 	while(len > 0) {
 		int xfer;
-		xfer = (len > qdl->out_maxpktsize) ? qdl->out_maxpktsize : len;
+		xfer = (len > qdl->out_maxpktsize * qdl->multiplier) ? qdl->out_maxpktsize * qdl->multiplier : len;
 
 		bulk.ep = qdl->out_ep;
 		bulk.len = xfer;
@@ -364,6 +381,9 @@ int qdl_write(struct qdl_device *qdl, const void *buf, size_t len)
 		if(n != xfer) {
 			fprintf(stderr, "ERROR: n = %d, errno = %d (%s)\n",
 				n, errno, strerror(errno));
+			if(errno == ENOMEM && qdl->multiplier != 1) {
+				fprintf(stderr, "Buffer multiplier set to %lu. Try using smaller multiplier!\n", qdl->multiplier);
+			}
 			return -1;
 		}
 		count += xfer;
@@ -389,7 +409,7 @@ static void print_usage(void)
 {
 	extern const char *__progname;
 	fprintf(stderr,
-		"%s [--debug] [--storage <emmc|nand|ufs>] [--finalize-provisioning] [--include <PATH>] <prog.mbn> [<program> <patch> ...]\n",
+		"%s [--debug] [--multiplier 1-2048] [--storage <emmc|nand|ufs>] [--finalize-provisioning] [--timeout <time_in_secs>] [--include <PATH>] <prog.mbn> [<program> <patch> ...]\n",
 		__progname);
 }
 
@@ -402,12 +422,16 @@ int main(int argc, char **argv)
 	int opt;
 	bool qdl_finalize_provisioning = false;
 
+	struct qdl_device qdl;
+	qdl.multiplier = 128;
 
 	static struct option options[] = {
 		{"debug", no_argument, 0, 'd'},
 		{"include", required_argument, 0, 'i'},
 		{"finalize-provisioning", no_argument, 0, 'l'},
 		{"storage", required_argument, 0, 's'},
+		{"multiplier", required_argument, 0, 'm'},
+		{"timeout", required_argument, 0, 't'},
 		{0, 0, 0, 0}
 	};
 
@@ -425,6 +449,14 @@ int main(int argc, char **argv)
 		case 's':
 			storage = optarg;
 			break;
+		case 't':
+			qdl_usb_open_timeout = strtol(optarg, NULL, 10);
+			break;
+		case 'm':
+			qdl.multiplier = strtol(optarg, NULL, 10);
+			if(qdl.multiplier >= 1 && qdl.multiplier <= 2048){
+				continue;
+			}
 		default:
 			print_usage();
 			return 1;
@@ -468,16 +500,25 @@ int main(int argc, char **argv)
 
 	ret = usb_open(&qdl);
 	if (ret)
+	{
+		fprintf(stderr, "usb_open failed with error code %d", ret);
 		return 1;
+	}
 
 	qdl.mappings[0] = prog_mbn;
 	ret = sahara_run(&qdl, qdl.mappings, true);
 	if (ret < 0)
+	{
+		fprintf(stderr, "sahara_run failed with error code %d", ret);
 		return 1;
+	}
 
 	ret = firehose_run(&qdl, incdir, storage);
 	if (ret < 0)
+	{
+		fprintf(stderr, "firehose_run failed with error code %d", ret);
 		return 1;
+	}
 
 	return 0;
 }
